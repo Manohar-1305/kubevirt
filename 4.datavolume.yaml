@@ -1,0 +1,159 @@
+# =====================================================
+# FINAL PersistentVolume (Golden Image)
+# =====================================================
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ubuntu-golden-pv01
+spec:
+  capacity:
+    storage: 20Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: local-lan-sc01
+  local:
+    path: /var/lib/kubevirt-disks/ubuntu-golden-image
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - master01
+---
+# =====================================================
+# SCRATCH PersistentVolume (CDI workspace)
+# =====================================================
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ubuntu-golden-scratch-pv01
+spec:
+  capacity:
+    storage: 5Gi
+  volumeMode: Filesystem
+  accessModes:
+    - ReadWriteOnce
+  persistentVolumeReclaimPolicy: Delete
+  storageClassName: local-lan-sc01
+  local:
+    path: /var/lib/kubevirt-disks/ubuntu-golden-scratch
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - master01
+---
+# =====================================================
+# SCRATCH PVC (required for local storage)
+# =====================================================
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ubuntu-golden-image-scratch
+  namespace: default
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-lan-sc01
+  resources:
+    requests:
+      storage: 5Gi
+---
+# =====================================================
+# DataVolume (THIS creates the final PVC)
+# =====================================================
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ubuntu-golden-image
+  namespace: default
+spec:
+  source:
+    http:
+      url: https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: local-lan-sc01
+    resources:
+      requests:
+        storage: 20Gi
+    volumeMode: Filesystem
+---
+# =====================================================
+# Consumer VM (triggers import)
+# =====================================================
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ubuntu-golden-consumer
+  namespace: default
+spec:
+  running: true
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: ubuntu-golden-consumer
+    spec:
+      nodeSelector:
+        kubernetes.io/hostname: master01
+
+      domain:
+        cpu:
+          cores: 2
+        resources:
+          requests:
+            memory: 1Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+            - name: cloudinit
+              disk:
+                bus: virtio
+          interfaces:
+            - name: podnet
+              masquerade: {}
+            - name: lannet
+              bridge: {}
+
+      networks:
+        - name: podnet
+          pod: {}
+        - name: lannet
+          multus:
+            networkName: lan-bridge-net01
+
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: ubuntu-golden-image
+        - name: cloudinit
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              disable_root: false
+              ssh_pwauth: true
+              chpasswd:
+                list: |
+                  root:root123
+                expire: false
+
+              runcmd:
+                - ip link set enp2s0 up
+                - dhclient enp2s0
+                - netplan apply
+                - sed -i 's/^#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
+                - sed -i 's/^PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+                - systemctl restart ssh
+                - apt-get update
+                - apt-get install -y qemu-guest-agent
+                - systemctl enable --now qemu-guest-agent
